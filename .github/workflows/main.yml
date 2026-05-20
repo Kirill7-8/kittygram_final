@@ -3,97 +3,131 @@ name: Kittygram CI/CD
 on:
   push:
     branches: [ main ]
+  pull_request:
 
 jobs:
-  tests:
+
+  backend_lint:
     runs-on: ubuntu-latest
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v5
+      - uses: actions/checkout@v3
 
-    - name: Set up Python
-      uses: actions/setup-python@v6
+      - name: Install Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.9
+
+      - name: Install dependencies
+        run: |
+          pip install ruff
+
+      - name: Run ruff
+        run: |
+          ruff check backend/
+
+  backend_tests:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:13
+        env:
+          POSTGRES_DB: test_db
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.9
+
+      - name: Install dependencies
+        run: |
+          pip install -r backend/requirements.txt
+
+      - name: Run backend tests
+        env:
+          POSTGRES_DB: test_db
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          DB_HOST: localhost
+          DB_PORT: 5432
+        run: |
+          cd backend
+          python manage.py migrate
+          python manage.py test
+
+  frontend_tests:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up nodeJS
+      # Это готовый воркфлоу для установки Node.js на раннер
+      uses: actions/setup-node@v4
       with:
-        python-version: '3.10'
-
-    - name: Install backend dependencies
+        # Это параметр воркфлоу, указывающий нужную версию Node.js
+        node-version: 18
+    - name: Install dependencies
+      # Эта команда устанавливает зависимости для фронтенда
       run: |
-        cd backend
-        pip install -r requirements.txt
-
-    - name: Lint with ruff
-      run: |
-        cd backend
-        pip install ruff
-        ruff check .
-
-    - name: Run backend tests
-      run: |
-        cd backend
-        python manage.py test
-
-    - name: Set up Node.js for frontend tests
-      uses: actions/setup-node@v6
-      with:
-        node-version: '18'
-
-    - name: Install frontend dependencies
-      run: |
-        cd frontend
+        cd frontend/
         npm ci
-
-    - name: Run frontend tests
+    - name: Test frontend
+      # Запускаем тесты
       run: |
-        cd frontend
-        npm test -- --watchAll=false
+        cd frontend/
+        npm run test
+
 
   build_and_push:
-    needs: tests
     runs-on: ubuntu-latest
+    needs: [backend_lint, backend_tests, frontend_tests]
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v2
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Build backend image
+        run: |
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/kittygram_backend ./backend
 
-    - name: Login to Docker Hub
-      uses: docker/login-action@v2
-      with:
-        username: ${{ secrets.DOCKER_USERNAME }}
-        password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Build frontend image
+        run: |
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/kittygram_frontend ./frontend
 
-    - name: Build and push backend image
-      uses: docker/build-push-action@v4
-      with:
-        context: ./backend
-        push: true
-        tags: ${{ secrets.DOCKER_USERNAME }}/kittygram_backend:latest
+      - name: Build nginx image
+        run: |
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/kittygram_gateway ./nginx
 
-    - name: Build and push frontend image
-      uses: docker/build-push-action@v4
-      with:
-        context: ./frontend
-        push: true
-        tags: ${{ secrets.DOCKER_USERNAME }}/kittygram_frontend:latest
+      - name: Push images
+        run: |
+          docker push ${{ secrets.DOCKER_USERNAME }}/kittygram_backend
+          docker push ${{ secrets.DOCKER_USERNAME }}/kittygram_frontend
+          docker push ${{ secrets.DOCKER_USERNAME }}/kittygram_gateway
 
-    - name: Build and push gateway image
-      uses: docker/build-push-action@v4
-      with:
-        context: ./nginx
-        push: true
-        tags: ${{ secrets.DOCKER_USERNAME }}/kittygram_gateway:latest
-
-  notify:
-    needs: build_and_push
+  telegram_notify:
     runs-on: ubuntu-latest
+    needs:
+      - build_and_push
     steps:
-    - name: Send Telegram notification
-      uses: appleboy/telegram-action@v0.1.1
+    - name: Send message
+      uses: appleboy/telegram-action@master
       with:
         to: ${{ secrets.TELEGRAM_TO }}
         token: ${{ secrets.TELEGRAM_TOKEN }}
-        message: |
-          deployment succeeded!
-          Repo: ${{ github.repository }}
-          Commit: ${{ github.sha }}
+        message: Kittygram образы успешно загружены на Docker Hub!
